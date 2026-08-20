@@ -19,6 +19,7 @@
 #include <X11/Xmd.h>
 #include <sys/wait.h>
 #include <present.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <dri3.h>
 #include <sys/stat.h>
@@ -1246,8 +1247,40 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
     return TRUE;
 }
 
+/*
+ * Termux:X11 does not use a DRM render node for the Android Mali vendor
+ * driver. Expose the Kbase device to DRI3 clients instead. Mesa's Panfrost
+ * Kbase backend consumes this fd and opens the Kbase UAPI on it.
+ *
+ * The path can be overridden for testing with TERMUX_X11_DRI3_DEVICE.
+ */
+static int
+lorieDri3OpenClient(__unused ClientPtr client,
+                    __unused ScreenPtr screen,
+                    __unused RRProviderPtr provider,
+                    int *fd)
+{
+    const char *device = getenv("TERMUX_X11_DRI3_DEVICE");
+
+    if (!device || !*device)
+        device = "/dev/mali0";
+
+    *fd = open(device, O_RDWR | O_CLOEXEC);
+    if (*fd < 0) {
+        log(ERROR, "DRI3: failed to open render device %s: %s",
+            device, strerror(errno));
+        return BadMatch;
+    }
+
+    if (lorieServerDebugEnabled)
+        log(INFO, "DRI3: opened render device %s as fd %d", device, *fd);
+
+    return Success;
+}
+
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
+        .open_client = lorieDri3OpenClient,
         .fds_from_pixmap = FalseNoop,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
