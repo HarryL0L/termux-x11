@@ -911,6 +911,11 @@ bool lorieRendererAvailable(void) {
 // GPU-sampleable, or the deferred copy queue is currently full.
 Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
                               uint64_t *out_serial, void **out_dst_buffer) {
+    if (lorieServerDebugEnabled && pixmap->drawable.width == pvfb->root.width && pixmap->drawable.height == pvfb->root.height) {
+        static uint32_t n;
+        if (++n <= 3 || n % 500 == 0)
+            log(INFO, "root-sized present %dx%d went through copy (core did not flip) #%u", pixmap->drawable.width, pixmap->drawable.height, n);
+    }
     LorieBuffer *srcBuffer, *dstBuffer;
     LoriePixmapPriv *priv;
     const LorieBuffer_Desc *desc, *dstDesc;
@@ -1040,13 +1045,19 @@ void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
 
 Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
     LoriePixmapPriv* priv = (LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap);
-    if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height)
+    if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height) {
+        if (lorieServerDebugEnabled)
+            log(INFO, "flip refused: pixmap %dx%d vs root %dx%d", pixmap->drawable.width, pixmap->drawable.height, pvfb->root.width, pvfb->root.height);
         return FALSE;
+    }
 
     const LorieBuffer_Desc *desc = LorieBuffer_description(priv->buffer);
     char *forceFlip = getenv("TERMUX_X11_FORCE_FLIP");
-    if (desc->type == LORIEBUFFER_FD && priv->imported && !(forceFlip && strcmp(forceFlip, "1") == 0))
+    if (desc->type == LORIEBUFFER_FD && priv->imported && !(forceFlip && strcmp(forceFlip, "1") == 0)) {
+        if (lorieServerDebugEnabled)
+            log(INFO, "flip refused: imported raw fd buffer");
         return FALSE; // For some reason it does not work fine with turnip.
+    }
 
     // Regular buffers can not be shared to activity, we must explicitly convert LorieBuffer to FD or AHardwareBuffer
     lorieEnsureGpuSampleable(pixmap, pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER);
@@ -1055,6 +1066,11 @@ Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unu
         return FALSE;
 
     lorieRegisterBuffer(priv->buffer);
+    if (lorieServerDebugEnabled) {
+        static uint32_t flips;
+        if (++flips <= 3 || flips % 500 == 0)
+            log(INFO, "flip #%u: %dx%d buffer type %d%s", flips, pixmap->drawable.width, pixmap->drawable.height, desc->type, sync_flip ? "" : " (async)");
+    }
     return TRUE;
 }
 
@@ -1074,6 +1090,9 @@ void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
 }
 
 static struct present_screen_info loriePresentInfo = {
+        // Async presents (swap interval 0: KWin, vblank_mode=0) are only flipped by the core if the driver
+        // claims async flip support. A flip here just hands the buffer to the renderer, so it is always async-safe.
+        .capabilities = PresentCapabilityAsync,
         .get_crtc = loriePresentGetCrtc,
         .get_ust_msc = loriePresentGetUstMsc,
         .queue_vblank = loriePresentQueueVblank,
