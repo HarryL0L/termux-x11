@@ -69,6 +69,7 @@ struct LorieBuffer {
     int32_t gpuCopyPending;
 
     int dmabufFd; // dma-buf behind this buffer for DMA_BUF_IOCTL_SYNC, -1 if unknown; not owned for AHardwareBuffers
+    void* pinnedData; // imported AHardwareBuffer kept gralloc-locked for its lifetime; CPU access then syncs via dmabufFd
 };
 
 void LorieBuffer_gpuCopyPendingInc(LorieBuffer* buffer) {
@@ -254,8 +255,31 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32
     return allocate(width, stride, height, format, LORIEBUFFER_FD, NULL, fd, stride * height * sizeof(uint32_t), offset, false);
 }
 
+static bool resolveDmaBuf(LorieBuffer* buffer);
+
+// gralloc may refuse usage the buffer was not allocated with (client buffers are typically CPU_READ_RARELY only).
+static int lockAHardwareBuffer(AHardwareBuffer* buffer, void** out) {
+    static const uint64_t usages[] = {
+        AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+        AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+        AHARDWAREBUFFER_USAGE_CPU_READ_RARELY,
+    };
+    int ret = -1;
+    if (__builtin_available(android 26, *)) {
+        for (size_t i = 0; i < sizeof(usages) / sizeof(usages[0]) && ret != 0; i++)
+            ret = AHardwareBuffer_lock(buffer, usages[i], -1, NULL, out);
+    }
+    return ret;
+}
+
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapAHardwareBuffer(AHardwareBuffer* buffer) {
-    return allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
+    LorieBuffer* b = allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
+    // Client-rendered buffer: gralloc lock/unlock per CPU copy is expensive (cache maintenance of the
+    // whole buffer twice). Lock once for the buffer's lifetime and keep coherent with the dma-buf sync
+    // ioctl instead, as raw-fd imports do. Only when the dma-buf is known, otherwise per-access locking.
+    if (b && resolveDmaBuf(b) && lockAHardwareBuffer(buffer, &b->pinnedData) != 0)
+        b->pinnedData = NULL;
+    return b;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_t format) {
@@ -341,8 +365,11 @@ __LIBC_HIDDEN__ void __LorieBuffer_free(LorieBuffer* buffer) {
             close(buffer->fd);
             break;
         case LORIEBUFFER_AHARDWAREBUFFER:
-            if (__builtin_available(android 26, *))
+            if (__builtin_available(android 26, *)) {
+                if (buffer->pinnedData)
+                    AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
                 AHardwareBuffer_release(buffer->desc.buffer);
+            }
             break;
         default: break;
     }
@@ -370,13 +397,15 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
     if (buffer->desc.type == LORIEBUFFER_REGULAR || buffer->desc.type == LORIEBUFFER_FD)
         buffer->lockedData = buffer->desc.data;
     else if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
-        if (__builtin_available(android 26, *))
-            ret = AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &buffer->lockedData);
+        if (buffer->pinnedData)
+            buffer->lockedData = buffer->pinnedData;
+        else
+            ret = lockAHardwareBuffer(buffer->desc.buffer, &buffer->lockedData);
     }
 
-    // Raw dma-buf imports shared with another process's GPU: invalidate the CPU view (Mali is not
-    // CPU-coherent). AHardwareBuffers are maintained by gralloc's own lock/unlock.
-    if (ret == 0 && buffer->dmabufFd >= 0 && buffer->desc.type == LORIEBUFFER_FD) {
+    // Buffers shared with another process's GPU and not maintained by a gralloc lock/unlock pair
+    // (raw-fd imports, pinned AHardwareBuffers): invalidate the CPU view (Mali is not CPU-coherent).
+    if (ret == 0 && buffer->dmabufFd >= 0 && (buffer->desc.type == LORIEBUFFER_FD || buffer->pinnedData)) {
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
         ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
     }
@@ -399,13 +428,13 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
         return ENOENT;
     }
 
-    // Flush CPU writes for the GPU that reads this raw dma-buf (gralloc handles AHardwareBuffers).
-    if (buffer->dmabufFd >= 0 && buffer->desc.type == LORIEBUFFER_FD) {
+    // Flush CPU writes for the GPU that reads this buffer (see LorieBuffer_lock).
+    if (buffer->dmabufFd >= 0 && (buffer->desc.type == LORIEBUFFER_FD || buffer->pinnedData)) {
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW };
         ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
     }
 
-    if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
+    if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER && !buffer->pinnedData) {
         if (__builtin_available(android 26, *))
             ret = AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
     }
@@ -525,6 +554,7 @@ __LIBC_HIDDEN__ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuf
     read(socketFd, &buffer, sizeof(buffer));
     buffer.image = NULL; // Only for process-local use
     buffer.dmabufFd = -1; // Only valid in the exporting (X server) process
+    buffer.pinnedData = NULL;
     if (buffer.desc.type == LORIEBUFFER_FD) {
         size_t size = buffer.desc.stride * buffer.desc.height * sizeof(uint32_t);
         buffer.fd = ancil_recv_fd(socketFd);
