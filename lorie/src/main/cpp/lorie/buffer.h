@@ -253,7 +253,6 @@ void LorieBuffer_describeAHardwareBuffer(AHardwareBuffer* _Nonnull buffer, AHard
 /**
  * Exports the dma-buf behind an AHardwareBuffer-backed buffer (for DRI3 fds_from_pixmap).
  * Returns a dup'd fd owned by the caller, or -1. outSize receives the dma-buf size.
- * Once resolved, LorieBuffer_lock/unlock apply DMA_BUF_IOCTL_SYNC to the buffer.
  */
 int LorieBuffer_exportDmaBuf(LorieBuffer* _Nullable buffer, size_t* _Nullable outSize);
 
