@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <dri3.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include "fb.h"
 #include "inputstr.h"
@@ -45,7 +46,7 @@
 extern void android_shmem_sysv_shm_force(uint8_t enable);
 
 #define unused __attribute__((unused))
-#define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
+#define log(prio, ...) lorieLogPrint(ANDROID_LOG_ ## prio, __VA_ARGS__)
 
 extern DeviceIntPtr lorieMouse, lorieKeyboard;
 
@@ -79,6 +80,7 @@ typedef struct {
 
     Bool dri3;
     Bool gpuPresentDisabled;
+    Bool pixmapExportDisabled;
 
     uint64_t vblank_interval;
     struct xorg_list vblank_queue;
@@ -109,6 +111,8 @@ static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
 typedef struct {
     LorieBuffer *buffer;
     bool flipped, wasLocked, imported;
+    bool exported; // a dma-buf of this pixmap was handed to a DRI3 client
+    uint32_t exportCount;
     void *locked;
     void *mem;
 } LoriePixmapPriv;
@@ -326,6 +330,7 @@ void ddxUseMsg(void) {
     ErrorF("-force-sysvshm         force using SysV shm syscalls\n");
     ErrorF("-check-drawing         run server only able to draw some test image (for testing if rendering root window works or not),\n");
     ErrorF("-disable-gpu-present   disable offloading Present copies to the GPU, always use the CPU path\n");
+    ErrorF("-disable-pixmap-export disable DRI3 BufferFromPixmap on redirected windows (backs them with plain memory again)\n");
 }
 
 int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
@@ -377,6 +382,11 @@ int ddxProcessArgument(unused int argc, unused char *argv[], unused int i) {
 
     if (strcmp(argv[i], "-disable-gpu-present") == 0) {
         pvfb->gpuPresentDisabled = TRUE;
+        return 1;
+    }
+
+    if (strcmp(argv[i], "-disable-pixmap-export") == 0) {
+        pvfb->pixmapExportDisabled = TRUE;
         return 1;
     }
 
@@ -926,6 +936,11 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         gpuCopyAttempts++;
         return FALSE;
     }
+    // No fence exists between the renderer's GL write and a compositor's GPU read of an exported pixmap: keep those on the CPU path.
+    if (LORIE_PIXMAP_PRIV_FROM_PIXMAP(dst)->exported || LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap)->exported) {
+        gpuCopyAttempts++;
+        return FALSE;
+    }
     priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
     if (priv->locked) {
         int status;
@@ -1086,15 +1101,28 @@ void *lorieCreatePixmap(__unused ScreenPtr pScreen, int width, int height, __unu
     if (width == 0 || height == 0)
         return priv;
 
-    uint8_t type = usage_hint != CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED ? LORIEBUFFER_REGULAR : pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
-    priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, type);
-    *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
+    uint8_t type = LORIEBUFFER_REGULAR, format = AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
+    if (usage_hint == CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED)
+        type = pvfb->root.legacyDrawing ? LORIEBUFFER_FD : LORIEBUFFER_AHARDWAREBUFFER;
+    else if (usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP && pvfb->dri3 && !pvfb->pixmapExportDisabled && !pvfb->root.legacyDrawing) {
+        // Redirected-window pixmap: gralloc-backed so DRI3 BufferFromPixmap can export it. BGRA because
+        // DRI3 clients infer X-native ARGB8888 from depth; allocated up front so the stride never changes.
+        type = LORIEBUFFER_AHARDWAREBUFFER;
+        format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
+    }
 
-    LorieBuffer_lock(priv->buffer, &priv->locked);
+    priv->buffer = LorieBuffer_allocate(width, height, format, type);
+    if (!priv->buffer && usage_hint == CREATE_PIXMAP_USAGE_BACKING_PIXMAP && type == LORIEBUFFER_AHARDWAREBUFFER) {
+        log(WARN, "CreatePixmap: AHardwareBuffer alloc %dx%d failed, window will not be exportable", width, height);
+        priv->buffer = LorieBuffer_allocate(width, height, AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM, LORIEBUFFER_REGULAR);
+    }
     if (!priv->buffer) {
         free(priv);
         return NULL;
     }
+
+    *new_fb_pitch = LorieBuffer_description(priv->buffer)->stride * 4;
+    LorieBuffer_lock(priv->buffer, &priv->locked);
 
     return priv;
 }
@@ -1233,6 +1261,70 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     return NULL;
 }
 
+// DRI3 BuffersFromPixmap (1.2): export the dma-buf behind an AHardwareBuffer-backed pixmap.
+static int lorieFdsFromPixmap(__unused ScreenPtr screen, PixmapPtr pixmap, int *fds, uint32_t *strides, uint32_t *offsets, uint64_t *modifier) {
+    LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
+    const LorieBuffer_Desc *desc;
+    size_t size = 0;
+    int fd;
+
+    if (!priv || !priv->buffer || priv->mem) {
+        log(WARN, "DRI3: fds_from_pixmap on pixmap %dx%d without a LorieBuffer", pixmap->drawable.width, pixmap->drawable.height);
+        return 0;
+    }
+
+    desc = LorieBuffer_description(priv->buffer);
+    if (desc->type != LORIEBUFFER_AHARDWAREBUFFER) {
+        log(WARN, "DRI3: fds_from_pixmap on pixmap %dx%d backed by type %d (not AHardwareBuffer); refusing",
+            pixmap->drawable.width, pixmap->drawable.height, desc->type);
+        return 0;
+    }
+    if (desc->format != AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM || priv->flipped) {
+        log(WARN, "DRI3: fds_from_pixmap on pixmap with non-BGRA layout (format %d, flipped %d); refusing", desc->format, priv->flipped);
+        return 0;
+    }
+
+    fd = LorieBuffer_exportDmaBuf(priv->buffer, &size);
+    if (fd < 0) {
+        log(ERROR, "DRI3: fds_from_pixmap: could not obtain dma-buf from gralloc handle");
+        return 0;
+    }
+
+    if (!priv->exported) {
+        priv->exported = TRUE;
+        // Drop the permanent CPU lock: per-access lock/unlock in Prepare/FinishAccess flushes caches for the importer.
+        if (priv->locked) {
+            LorieBuffer_unlock(priv->buffer);
+            priv->locked = NULL;
+        }
+    }
+
+    fds[0] = fd;
+    strides[0] = desc->stride * 4;
+    offsets[0] = 0;
+    *modifier = DRM_FORMAT_MOD_LINEAR; // CPU usage bits at allocation preclude AFBC
+    priv->exportCount++;
+    if (lorieServerDebugEnabled && (priv->exportCount <= 3 || priv->exportCount % 200 == 0))
+        log(INFO, "DRI3: exported pixmap %dx%d stride %u size %zu fd %d (#%u)", pixmap->drawable.width, pixmap->drawable.height, strides[0], size, fd, priv->exportCount);
+    return 1;
+}
+
+// DRI3 BufferFromPixmap (1.0): same export, with the dma-buf's real size.
+static int lorieFdFromPixmap(ScreenPtr screen, PixmapPtr pixmap, CARD16 *stride, CARD32 *size) {
+    int fds[4];
+    uint32_t strides[4], offsets[4];
+    uint64_t modifier;
+    off_t end;
+
+    if (lorieFdsFromPixmap(screen, pixmap, fds, strides, offsets, &modifier) != 1)
+        return -1;
+
+    *stride = strides[0];
+    end = lseek(fds[0], 0, SEEK_END); // dma-bufs report their size this way
+    *size = end > 0 ? (CARD32) end : strides[0] * pixmap->drawable.height;
+    return fds[0];
+}
+
 static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD32 **formats) {
     static CARD32 format = DRM_FORMAT_ARGB8888;
     *num_formats = 1;
@@ -1241,7 +1333,8 @@ static int lorieGetFormats(__unused ScreenPtr screen, CARD32 *num_formats, CARD3
 }
 
 static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_t *num_modifiers, uint64_t **modifiers) {
-    static uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+    // 1255: clients may present AHardwareBuffers over a Unix socket (see loriePixmapFromFds), which avoids CPU copies.
+    static uint64_t mods[] = { DRM_FORMAT_MOD_LINEAR, 1255 /* AHARDWAREBUFFER_SOCKET_FD */ };
 
     if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888) {
         *num_modifiers = 0;
@@ -1249,14 +1342,15 @@ static int lorieGetModifiers(__unused ScreenPtr screen, uint32_t format, uint32_
         return TRUE;
     }
 
-    *num_modifiers = 1;
-    *modifiers = &modifier;
+    *num_modifiers = pvfb->root.legacyDrawing ? 1 : 2;
+    *modifiers = mods;
     return TRUE;
 }
 
 static dri3_screen_info_rec lorieDri3Info = {
         .version = 2,
-        .fds_from_pixmap = FalseNoop,
+        .fd_from_pixmap = lorieFdFromPixmap,
+        .fds_from_pixmap = lorieFdsFromPixmap,
         .pixmap_from_fds = loriePixmapFromFds,
         .get_formats = lorieGetFormats,
         .get_modifiers = lorieGetModifiers,
