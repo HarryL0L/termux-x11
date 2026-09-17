@@ -254,13 +254,8 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32
     return allocate(width, stride, height, format, LORIEBUFFER_FD, NULL, fd, stride * height * sizeof(uint32_t), offset, false);
 }
 
-static bool resolveDmaBuf(LorieBuffer* buffer);
-
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapAHardwareBuffer(AHardwareBuffer* buffer) {
-    LorieBuffer* b = allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
-    if (b)
-        resolveDmaBuf(b); // GPU-written by a client: CPU access needs cache maintenance
-    return b;
+    return allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_t format) {
@@ -379,8 +374,9 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
             ret = AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &buffer->lockedData);
     }
 
-    // Buffers shared with another process's GPU: invalidate the CPU view (Mali is not CPU-coherent).
-    if (ret == 0 && buffer->dmabufFd >= 0) {
+    // Raw dma-buf imports shared with another process's GPU: invalidate the CPU view (Mali is not
+    // CPU-coherent). AHardwareBuffers are maintained by gralloc's own lock/unlock.
+    if (ret == 0 && buffer->dmabufFd >= 0 && buffer->desc.type == LORIEBUFFER_FD) {
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
         ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
     }
@@ -403,8 +399,8 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
         return ENOENT;
     }
 
-    // Flush CPU writes for the GPU that reads this dma-buf.
-    if (buffer->dmabufFd >= 0) {
+    // Flush CPU writes for the GPU that reads this raw dma-buf (gralloc handles AHardwareBuffers).
+    if (buffer->dmabufFd >= 0 && buffer->desc.type == LORIEBUFFER_FD) {
         struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW };
         ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
     }
