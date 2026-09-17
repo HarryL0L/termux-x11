@@ -14,6 +14,27 @@
 #include <stdbool.h>
 #include <linux/memfd.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <stdarg.h>
+#if __has_include(<linux/dma-buf.h>)
+#include <linux/dma-buf.h>
+#endif
+#ifndef DMA_BUF_IOCTL_SYNC
+// Fallback for sysroots without <linux/dma-buf.h>; the UAPI is stable.
+struct dma_buf_sync { uint64_t flags; };
+#define DMA_BUF_SYNC_READ      (1 << 0)
+#define DMA_BUF_SYNC_WRITE     (2 << 0)
+#define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START     (0 << 2)
+#define DMA_BUF_SYNC_END       (1 << 2)
+#define DMA_BUF_BASE           'b'
+#define DMA_BUF_IOCTL_SYNC     _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+#endif
+#include <android/log.h>
+
+// cutils native_handle_t (stable ABI; the NDK only forward-declares it).
+typedef struct { int version, numFds, numInts; int data[]; } LorieNativeHandle;
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -46,6 +67,8 @@ struct LorieBuffer {
     struct xorg_list link;
 
     int32_t gpuCopyPending;
+
+    int dmabufFd; // dma-buf behind this buffer for DMA_BUF_IOCTL_SYNC, -1 if unknown; not owned for AHardwareBuffers
 };
 
 void LorieBuffer_gpuCopyPendingInc(LorieBuffer* buffer) {
@@ -125,11 +148,21 @@ int LorieBuffer_createRegion(char const* name, size_t size) {
 }
 #pragma clang diagnostic pop
 
+// Only dma-bufs accept DMA_BUF_IOCTL_SYNC (memfd/ashmem return ENOTTY).
+static bool isDmaBuf(int fd) {
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    if (fd < 0 || ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) != 0)
+        return false;
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    return true;
+}
+
 static LorieBuffer* allocate(int32_t width, int32_t stride, int32_t height, int8_t format, int8_t type, AHardwareBuffer *buf, int fd, size_t size, off_t offset, bool takeFd) {
     AHardwareBuffer_Desc desc = {0};
     static uint64_t id = 0;
     bool acceptable = (format == AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM || format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM) && width > 0 && height > 0;
-    LorieBuffer b = { .desc = { .width = width, .stride = stride, .height = height, .format = format, .type = type, .buffer = buf, .id = id++ }, .fd = takeFd ? fd : dup(fd), .size = size, .offset = offset };
+    LorieBuffer b = { .desc = { .width = width, .stride = stride, .height = height, .format = format, .type = type, .buffer = buf, .id = id++ }, .fd = takeFd ? fd : dup(fd), .size = size, .offset = offset, .dmabufFd = -1 };
 
     if (type != LORIEBUFFER_AHARDWAREBUFFER && !acceptable)
         return NULL;
@@ -151,6 +184,8 @@ static LorieBuffer* allocate(int32_t width, int32_t stride, int32_t height, int8
                 close(b.fd);
                 return NULL;
             }
+            if (isDmaBuf(b.fd))
+                b.dmabufFd = b.fd; // client-rendered: CPU access needs cache maintenance
             break;
         case LORIEBUFFER_AHARDWAREBUFFER: {
             if (!b.desc.buffer)
@@ -219,8 +254,13 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32
     return allocate(width, stride, height, format, LORIEBUFFER_FD, NULL, fd, stride * height * sizeof(uint32_t), offset, false);
 }
 
+static bool resolveDmaBuf(LorieBuffer* buffer);
+
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapAHardwareBuffer(AHardwareBuffer* buffer) {
-    return allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
+    LorieBuffer* b = allocate(0, 0, 0, 0, LORIEBUFFER_AHARDWAREBUFFER, buffer, -1, 0, 0, false);
+    if (b)
+        resolveDmaBuf(b); // GPU-written by a client: CPU access needs cache maintenance
+    return b;
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_convert(LorieBuffer* buffer, int8_t type, int8_t format) {
@@ -339,6 +379,12 @@ __LIBC_HIDDEN__ int LorieBuffer_lock(LorieBuffer* buffer, void** out) {
             ret = AHardwareBuffer_lock(buffer->desc.buffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &buffer->lockedData);
     }
 
+    // Buffers shared with another process's GPU: invalidate the CPU view (Mali is not CPU-coherent).
+    if (ret == 0 && buffer->dmabufFd >= 0) {
+        struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
+        ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+
     if (out)
         *out = buffer->lockedData;
 
@@ -357,6 +403,12 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
         return ENOENT;
     }
 
+    // Flush CPU writes for the GPU that reads this dma-buf.
+    if (buffer->dmabufFd >= 0) {
+        struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW };
+        ioctl(buffer->dmabufFd, DMA_BUF_IOCTL_SYNC, &sync);
+    }
+
     if (buffer->desc.type == LORIEBUFFER_AHARDWAREBUFFER) {
         if (__builtin_available(android 26, *))
             ret = AHardwareBuffer_unlock(buffer->desc.buffer, NULL);
@@ -366,6 +418,86 @@ __LIBC_HIDDEN__ int LorieBuffer_unlock(LorieBuffer* buffer) {
     buffer->locked = false;
 
     return ret;
+}
+
+__LIBC_HIDDEN__ void lorieLogPrint(int prio, const char* fmt, ...) {
+    static int toStderr = -1;
+    va_list ap;
+    if (toStderr < 0)
+        toStderr = getenv("TERMUX_X11_DEBUG") != NULL;
+
+    va_start(ap, fmt);
+    __android_log_vprint(prio, "LorieNative", fmt, ap);
+    va_end(ap);
+
+    if (toStderr) {
+        static const char levels[] = "??VDIWEF";
+        char line[1024];
+        va_start(ap, fmt);
+        vsnprintf(line, sizeof(line), fmt, ap);
+        va_end(ap);
+        dprintf(2, "[LorieNative %c] %s\n", (prio >= 0 && prio < (int) sizeof(levels) - 1) ? levels[prio] : '?', line);
+    }
+}
+
+// AHardwareBuffer_getNativeHandle is exported by libnativewindow.so (API 26+) but absent from the NDK stub.
+typedef const void* (*getNativeHandle_t)(const AHardwareBuffer*);
+static getNativeHandle_t resolveGetNativeHandle(void) {
+    static getNativeHandle_t fn = NULL;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        void* lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_NOLOAD) ?: dlopen("libnativewindow.so", RTLD_NOW);
+        if (lib)
+            fn = (getNativeHandle_t) dlsym(lib, "AHardwareBuffer_getNativeHandle");
+        if (!fn)
+            fn = (getNativeHandle_t) dlsym(RTLD_DEFAULT, "AHardwareBuffer_getNativeHandle");
+        if (!fn)
+            lorieLogPrint(ANDROID_LOG_ERROR, "AHardwareBuffer_getNativeHandle unavailable; DRI3 pixmap export disabled");
+    }
+    return fn;
+}
+
+static off_t fdSize(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0)
+        return st.st_size;
+    return lseek(fd, 0, SEEK_END); // dma-bufs report their size this way
+}
+
+// Finds the pixel dma-buf in the gralloc handle: the first fd whose size covers the pixels
+// (MediaTek: data[1] behind a gralloc_extra fd; most others: data[0]).
+static bool resolveDmaBuf(LorieBuffer* buffer) {
+    const LorieNativeHandle* h;
+    getNativeHandle_t fn;
+    size_t need;
+
+    if (!buffer || buffer->desc.type != LORIEBUFFER_AHARDWAREBUFFER || !buffer->desc.buffer)
+        return false;
+    if (buffer->dmabufFd >= 0)
+        return true;
+    if (!(fn = resolveGetNativeHandle()) || !(h = fn(buffer->desc.buffer)))
+        return false;
+
+    need = (size_t) buffer->desc.stride * buffer->desc.height * 4;
+    for (int i = 0; i < h->numFds; i++) {
+        off_t size = fdSize(h->data[i]);
+        if (size >= (off_t) need) {
+            buffer->dmabufFd = h->data[i];
+            buffer->size = (size_t) size;
+            return true;
+        }
+    }
+    lorieLogPrint(ANDROID_LOG_ERROR, "no fd in the gralloc handle (%d fds) covers %zu bytes", h->numFds, need);
+    return false;
+}
+
+__LIBC_HIDDEN__ int LorieBuffer_exportDmaBuf(LorieBuffer* buffer, size_t* outSize) {
+    if (outSize) *outSize = 0;
+    if (!resolveDmaBuf(buffer))
+        return -1;
+    if (outSize) *outSize = buffer->size;
+    return fcntl(buffer->dmabufFd, F_DUPFD_CLOEXEC, 0);
 }
 
 __LIBC_HIDDEN__ void LorieBuffer_sendHandleToUnixSocket(LorieBuffer* _Nonnull buffer, int socketFd) {
@@ -396,6 +528,7 @@ __LIBC_HIDDEN__ void LorieBuffer_recvHandleFromUnixSocket(int socketFd, LorieBuf
 
     read(socketFd, &buffer, sizeof(buffer));
     buffer.image = NULL; // Only for process-local use
+    buffer.dmabufFd = -1; // Only valid in the exporting (X server) process
     if (buffer.desc.type == LORIEBUFFER_FD) {
         size_t size = buffer.desc.stride * buffer.desc.height * sizeof(uint32_t);
         buffer.fd = ancil_recv_fd(socketFd);
