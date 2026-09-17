@@ -250,7 +250,20 @@ int LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(int socketFd, AHardwareB
  */
 void LorieBuffer_describeAHardwareBuffer(AHardwareBuffer* _Nonnull buffer, AHardwareBuffer_Desc* _Nonnull outDesc);
 
+/**
+ * Exports the dma-buf behind an AHardwareBuffer-backed buffer (for DRI3 fds_from_pixmap).
+ * Returns a dup'd fd owned by the caller, or -1. outSize receives the dma-buf size.
+ * Once resolved, LorieBuffer_lock/unlock apply DMA_BUF_IOCTL_SYNC to the buffer.
+ */
+int LorieBuffer_exportDmaBuf(LorieBuffer* _Nullable buffer, size_t* _Nullable outSize);
+
 #undef STATIC_INLINE
+
+/**
+ * Logs to logcat (tag LorieNative) and, when the TERMUX_X11_DEBUG environment variable is set,
+ * also to stderr, i.e. the Termux terminal the server was started from (no adb needed).
+ */
+void lorieLogPrint(int prio, const char* _Nonnull fmt, ...) __attribute__((format(printf, 2, 3)));
 
 int ancil_send_fd(int sock, int fd);
 int ancil_recv_fd(int sock);
